@@ -12,6 +12,13 @@ resource "google_cloud_run_v2_service" "n8n_service" {
       ports {
         container_port = 5678
       }
+
+      resources {
+        limits = {
+          "cpu"    = "2000m"
+          "memory" = "8Gi"
+        }
+      }
       
       env {
         name  = "DB_TYPE"
