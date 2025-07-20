@@ -1,0 +1,328 @@
+steps:
+# Enable required Google Cloud APIs
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: 'enable-apis'
+  args:
+    - 'services'
+    - 'enable'
+    - 'cloudresourcemanager.googleapis.com'
+    - 'secretmanager.googleapis.com'
+    - 'compute.googleapis.com'
+    - 'run.googleapis.com'
+    - 'sqladmin.googleapis.com'
+    - 'iap.googleapis.com'
+    - 'artifactregistry.googleapis.com'
+    - 'cloudbuild.googleapis.com'
+    - 'vpcaccess.googleapis.com'
+    - 'servicenetworking.googleapis.com'
+
+# Create Secret Manager secrets if they don't exist
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: 'create-secrets'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "Creating Secret Manager secrets..."
+      
+      # Function to create secret if it doesn't exist
+      create_secret_if_not_exists() {
+        local secret_name=$$1
+        local secret_value=$$2
+        
+        if ! gcloud secrets describe $$secret_name --quiet 2>/dev/null; then
+          echo "Creating secret: $$secret_name"
+          echo -n "$$secret_value" | gcloud secrets create $$secret_name --data-file=-
+        else
+          echo "Secret $$secret_name already exists"
+        fi
+      }
+      
+      # Create database secrets (replace with actual values)
+      create_secret_if_not_exists "n8n-db-user" "n8n_user"
+      create_secret_if_not_exists "n8n-db-password" "temp_password_change_me"
+      create_secret_if_not_exists "n8n-db-name" "n8n"
+      
+      # Create IAP OAuth secrets (will be updated with actual values after Terraform creates the client)
+      create_secret_if_not_exists "n8n-iap-oauth-client-id" "temp_client_id_change_me"
+      create_secret_if_not_exists "n8n-iap-oauth-client-secret" "temp_client_secret_change_me"
+      
+      echo "Secret creation completed"
+
+# Initialize Terraform
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-init'
+  entrypoint: 'terraform'
+  args: ['init']
+  dir: 'terraform'
+
+# Import existing global IP if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-ip'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_global_address.default projects/${PROJECT_ID}/global/addresses/n8n-lb-ip || echo "Global IP import skipped"'
+
+# Import existing SSL certificate if it exists  
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-cert'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_managed_ssl_certificate.default projects/${PROJECT_ID}/global/sslCertificates/n8n-ssl-cert || echo "SSL cert import skipped"'
+
+# Import existing IAP brand if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-iap-brand'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_iap_brand.project_brand projects/832029759433/brands/832029759433 || echo "IAP brand import skipped"'
+
+# Remove any invalid IAP client from Terraform state and clean up
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-cleanup-iap-client'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - |
+      cd terraform
+      echo "Removing any existing IAP client from Terraform state..."
+      terraform state rm google_iap_client.project_client 2>/dev/null || echo "No IAP client in state to remove"
+
+# Check for existing valid IAP OAuth clients and manage them
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: 'manage-iap-client'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "Managing IAP OAuth client..."
+      
+      # Function to create new IAP client
+      create_new_iap_client() {
+        echo "Creating new IAP OAuth client..."
+        # Create the client via Terraform (will be applied later)
+        echo "NEW_CLIENT_NEEDED" > /workspace/iap_action.txt
+        # Clear old invalid secrets
+        echo -n "temp_client_id_change_me" | gcloud secrets versions add n8n-iap-oauth-client-id --data-file=- || echo "Failed to update client ID secret"
+        echo -n "temp_client_secret_change_me" | gcloud secrets versions add n8n-iap-oauth-client-secret --data-file=- || echo "Failed to update client secret"
+      }
+      
+      # Check if current stored client ID is valid
+      STORED_CLIENT_ID=$$(gcloud secrets versions access latest --secret="n8n-iap-oauth-client-id" 2>/dev/null || echo "")
+      
+      if [ -z "$$STORED_CLIENT_ID" ] || [ "$$STORED_CLIENT_ID" = "temp_client_id_change_me" ]; then
+        echo "No valid client ID stored, will create new client"
+        create_new_iap_client
+      else
+        echo "Checking if stored client ID is valid: $$STORED_CLIENT_ID"
+        # Try to verify the client exists (this will help us determine if it's valid)
+        ACCESS_TOKEN=$$(gcloud auth application-default print-access-token)
+        HTTP_CODE=$$(curl -s -w "%{http_code}" -o /workspace/client_check.json -H "Authorization: Bearer $$ACCESS_TOKEN" "https://iap.googleapis.com/v1/projects/832029759433/brands/832029759433/identityAwareProxyClients/$$STORED_CLIENT_ID")
+        
+        if [ "$$HTTP_CODE" = "200" ]; then
+          echo "Existing client is valid, will import it"
+          echo "IMPORT_CLIENT" > /workspace/iap_action.txt
+          echo "$$STORED_CLIENT_ID" > /workspace/iap_client_id.txt
+        else
+          echo "Stored client ID is invalid (HTTP $$HTTP_CODE), will create new client"
+          create_new_iap_client
+        fi
+      fi
+
+# Import existing valid IAP OAuth client if found
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-iap-client'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - |
+      cd terraform
+      if [ -f /workspace/iap_action.txt ]; then
+        ACTION=$$(cat /workspace/iap_action.txt)
+        if [ "$$ACTION" = "IMPORT_CLIENT" ] && [ -f /workspace/iap_client_id.txt ]; then
+          CLIENT_ID=$$(cat /workspace/iap_client_id.txt)
+          echo "Importing valid IAP client: $$CLIENT_ID"
+          terraform import google_iap_client.project_client projects/832029759433/brands/832029759433/identityAwareProxyClients/$$CLIENT_ID || echo "IAP client import failed"
+        else
+          echo "Will create new IAP client via Terraform apply"
+        fi
+      fi
+
+# Import existing VPC connector if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-vpc-connector'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_vpc_access_connector.connector projects/personal-n8n-playground/locations/us-central1/connectors/n8n-vpc-connector || echo "VPC connector import skipped"'
+
+# Import existing Cloud Run service if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-cloudrun'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_cloud_run_v2_service.n8n_service projects/personal-n8n-playground/locations/us-central1/services/n8n || echo "Cloud Run service import skipped"'
+
+# Import existing Network Endpoint Group if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-neg'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_region_network_endpoint_group.serverless_neg projects/personal-n8n-playground/regions/us-central1/networkEndpointGroups/n8n-neg || echo "NEG import skipped"'
+
+# Import existing Backend Service if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-backend'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_backend_service.default projects/personal-n8n-playground/global/backendServices/n8n-backend || echo "Backend service import skipped"'
+
+# Import existing URL Map if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-urlmap'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_url_map.default projects/personal-n8n-playground/global/urlMaps/n8n-url-map || echo "URL map import skipped"'
+
+# Import existing HTTPS Proxy if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-proxy'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_target_https_proxy.default projects/personal-n8n-playground/global/targetHttpsProxies/n8n-https-proxy || echo "HTTPS proxy import skipped"'
+
+# Import existing Global Forwarding Rule if it exists
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-import-forwarding-rule'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - 'cd terraform && terraform import google_compute_global_forwarding_rule.default projects/personal-n8n-playground/global/forwardingRules/n8n-forwarding-rule || echo "Forwarding rule import skipped"'
+
+# Build the container image
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'build-container'
+  args: ['build', '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_N8N_SERVICE_NAME}:latest', '.']
+
+# Push the container image to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'push-container'
+  args: ['push', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_N8N_SERVICE_NAME}:latest']
+
+# Apply Terraform changes
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'terraform-apply'
+  entrypoint: 'terraform'
+  args:
+    - 'apply'
+    - '-auto-approve'
+    - '-var=project_id=${PROJECT_ID}'
+    - '-var=region=${_REGION}'
+    - '-var=cloud_sql_instance_name=${_CLOUD_SQL_INSTANCE_NAME}'
+    - '-var=domain_name=${_DOMAIN_NAME}'
+    - '-var=n8n_service_name=${_N8N_SERVICE_NAME}'
+    - '-var=repo_name=${_REPO_NAME}'
+  dir: 'terraform'
+
+# Extract IAP client credentials from Terraform state
+- name: 'hashicorp/terraform:1.2.5'
+  id: 'extract-iap-credentials'
+  entrypoint: 'sh'
+  args:
+    - '-c'
+    - |
+      echo "Extracting IAP client credentials from Terraform state..."
+      cd terraform
+      
+      # Extract client ID from terraform output (not sensitive)
+      CLIENT_ID=$$(terraform output -raw iap_oauth_client_id 2>/dev/null || echo "")
+      
+      # Extract client secret using IAP API (more reliable than parsing Terraform output)
+      CLIENT_SECRET=""
+      if [ ! -z "$$CLIENT_ID" ] && [ "$$CLIENT_ID" != "null" ] && [ "$$CLIENT_ID" != "temp_client_id_change_me" ]; then
+        # Use IAP API to get the secret directly
+        ACCESS_TOKEN=$$(gcloud auth print-access-token 2>/dev/null || echo "")
+        if [ ! -z "$$ACCESS_TOKEN" ]; then
+          CLIENT_SECRET=$$(curl -s -H "Authorization: Bearer $$ACCESS_TOKEN" "https://iap.googleapis.com/v1/projects/832029759433/brands/832029759433/identityAwareProxyClients/$$CLIENT_ID" | grep -o '"secret":"[^"]*"' | cut -d'"' -f4 || echo "")
+        fi
+      fi
+      
+      # Fallback: Try terraform state show if API method fails
+      if [ -z "$$CLIENT_SECRET" ]; then
+        CLIENT_SECRET=$$(terraform state show google_iap_client.project_client 2>/dev/null | grep "secret" | sed 's/.*= "\(.*\)"/\1/' | sed 's/\x1b\[[0-9;]*m//g' || echo "")
+      fi
+      
+      # Store credentials in workspace files for next step
+      echo "$$CLIENT_ID" > /workspace/iap_client_id_extracted.txt
+      echo "$$CLIENT_SECRET" > /workspace/iap_client_secret_extracted.txt
+      
+      echo "Extracted Client ID: $$CLIENT_ID"
+      echo "Extracted Client Secret: $$(echo $$CLIENT_SECRET | cut -c1-10)..."
+      
+      # Debug output
+      echo "Terraform state check:"
+      terraform state show google_iap_client.project_client 2>/dev/null | head -10 || echo "No IAP client in state"
+
+# Update Secret Manager with extracted IAP client credentials
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: 'update-iap-secrets'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "Updating IAP client credentials in Secret Manager..."
+      
+      # Read extracted credentials from workspace files
+      CLIENT_ID=""
+      CLIENT_SECRET=""
+      
+      if [ -f /workspace/iap_client_id_extracted.txt ]; then
+        CLIENT_ID=$$(cat /workspace/iap_client_id_extracted.txt)
+      fi
+      
+      if [ -f /workspace/iap_client_secret_extracted.txt ]; then
+        CLIENT_SECRET=$$(cat /workspace/iap_client_secret_extracted.txt)
+      fi
+      
+      echo "Found Client ID: $$CLIENT_ID"
+      echo "Found Client Secret: $$(echo $$CLIENT_SECRET | cut -c1-10)..."
+      
+      # Update secrets if we found valid values
+      if [ ! -z "$$CLIENT_ID" ] && [ "$$CLIENT_ID" != "null" ] && [ "$$CLIENT_ID" != "temp_client_id_change_me" ]; then
+        echo "Updating client ID in Secret Manager..."
+        echo -n "$$CLIENT_ID" | gcloud secrets versions add n8n-iap-oauth-client-id --data-file=-
+        echo "Client ID updated successfully"
+      else
+        echo "Warning: No valid client ID found to update"
+      fi
+      
+      if [ ! -z "$$CLIENT_SECRET" ] && [ "$$CLIENT_SECRET" != "null" ] && [ "$$CLIENT_SECRET" != "temp_client_secret_change_me" ]; then
+        echo "Updating client secret in Secret Manager..."
+        echo -n "$$CLIENT_SECRET" | gcloud secrets versions add n8n-iap-oauth-client-secret --data-file=-
+        echo "Client secret updated successfully"
+      else
+        echo "Warning: No valid client secret found to update"
+      fi
+      
+      # Verify what's now in Secret Manager
+      echo "Current secrets in Secret Manager:"
+      echo "Client ID: $$(gcloud secrets versions access latest --secret='n8n-iap-oauth-client-id' 2>/dev/null || echo 'ERROR')"
+      echo "Client Secret: $$(gcloud secrets versions access latest --secret='n8n-iap-oauth-client-secret' 2>/dev/null | cut -c1-10)..." # Only show first 10 chars
+
+substitutions:
+  _REGION: us-central1
+  _CLOUD_SQL_INSTANCE_NAME: n8n-db
+  _DOMAIN_NAME: n8n.maoye.demo.altostrat.com
+  _N8N_SERVICE_NAME: n8n
+  _REPO_NAME: n8n-repo
+
+images:
+- '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_N8N_SERVICE_NAME}:latest'
