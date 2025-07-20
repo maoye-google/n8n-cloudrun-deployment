@@ -278,45 +278,43 @@ steps:
   args:
     - '-c'
     - |
-      echo "Updating IAP client credentials in Secret Manager..."
+      set -e
+      echo "Checking and updating IAP client credentials in Secret Manager..."
       
-      # Read extracted credentials from workspace files
-      CLIENT_ID=""
-      CLIENT_SECRET=""
+      CLIENT_ID=$$(cat /workspace/iap_client_id_extracted.txt 2>/dev/null || echo "")
+      CLIENT_SECRET=$$(cat /workspace/iap_client_secret_extracted.txt 2>/dev/null || echo "")
       
-      if [ -f /workspace/iap_client_id_extracted.txt ]; then
-        CLIENT_ID=$$(cat /workspace/iap_client_id_extracted.txt)
-      fi
+      echo "Found Client ID from Terraform state: $$CLIENT_ID"
       
-      if [ -f /workspace/iap_client_secret_extracted.txt ]; then
-        CLIENT_SECRET=$$(cat /workspace/iap_client_secret_extracted.txt)
-      fi
+      # Check current client ID in Secret Manager
+      EXISTING_CLIENT_ID=$$(gcloud secrets versions access latest --secret="n8n-iap-oauth-client-id" 2>/dev/null || echo "")
       
-      echo "Found Client ID: $$CLIENT_ID"
-      echo "Found Client Secret: $$(echo $$CLIENT_SECRET | cut -c1-10)..."
-      
-      # Update secrets if we found valid values
-      if [ ! -z "$$CLIENT_ID" ] && [ "$$CLIENT_ID" != "null" ] && [ "$$CLIENT_ID" != "temp_client_id_change_me" ]; then
-        echo "Updating client ID in Secret Manager..."
-        echo -n "$$CLIENT_ID" | gcloud secrets versions add n8n-iap-oauth-client-id --data-file=-
-        echo "Client ID updated successfully"
+      # Update client ID only if it's a placeholder or empty
+      if [ "$$EXISTING_CLIENT_ID" = "temp_client_id_change_me" ] || [ -z "$$EXISTING_CLIENT_ID" ]; then
+        if [ ! -z "$$CLIENT_ID" ] && [ "$$CLIENT_ID" != "null" ]; then
+          echo "Updating client ID in Secret Manager..."
+          echo -n "$$CLIENT_ID" | gcloud secrets versions add n8n-iap-oauth-client-id --data-file=-
+        else
+          echo "Warning: No valid new client ID found to update."
+        fi
       else
-        echo "Warning: No valid client ID found to update"
+        echo "Client ID already exists in Secret Manager. Skipping update."
       fi
       
-      if [ ! -z "$$CLIENT_SECRET" ] && [ "$$CLIENT_SECRET" != "null" ] && [ "$$CLIENT_SECRET" != "temp_client_secret_change_me" ]; then
-        echo "Updating client secret in Secret Manager..."
-        echo -n "$$CLIENT_SECRET" | gcloud secrets versions add n8n-iap-oauth-client-secret --data-file=-
-        echo "Client secret updated successfully"
+      # Check current client secret in Secret Manager
+      EXISTING_CLIENT_SECRET=$$(gcloud secrets versions access latest --secret="n8n-iap-oauth-client-secret" 2>/dev/null || echo "")
+      
+      # Update client secret only if it's a placeholder or empty
+      if [ "$$EXISTING_CLIENT_SECRET" = "temp_client_secret_change_me" ] || [ -z "$$EXISTING_CLIENT_SECRET" ]; then
+        if [ ! -z "$$CLIENT_SECRET" ] && [ "$$CLIENT_SECRET" != "null" ]; then
+          echo "Updating client secret in Secret Manager..."
+          echo -n "$$CLIENT_SECRET" | gcloud secrets versions add n8n-iap-oauth-client-secret --data-file=-
+        else
+          echo "Warning: No valid new client secret found to update."
+        fi
       else
-        echo "Warning: No valid client secret found to update"
+        echo "Client secret already exists in Secret Manager. Skipping update."
       fi
-      
-      # Verify what's now in Secret Manager
-      echo "Current secrets in Secret Manager:"
-      echo "Client ID: $$(gcloud secrets versions access latest --secret='n8n-iap-oauth-client-id' 2>/dev/null || echo 'ERROR')"
-      echo "Client Secret: $$(gcloud secrets versions access latest --secret='n8n-iap-oauth-client-secret' 2>/dev/null | cut -c1-10)..." # Only show first 10 chars
-
 substitutions:
   _REGION: us-central1
   _CLOUD_SQL_INSTANCE_NAME: n8n-db

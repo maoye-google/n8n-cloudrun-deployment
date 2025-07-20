@@ -54,7 +54,11 @@ resource "google_cloud_run_v2_service" "n8n_service" {
       }
       env {
         name  = "WEBHOOK_URL"
-        value = "https://${var.domain_name}/"
+        value = "https://${var.domain_name}"
+      }
+      env {
+        name  = "N8N_EDITOR_BASE_URL"
+        value = "https://${var.domain_name}"
       }
       env {
         name  = "DB_POSTGRESDB_CONNECTION_TIMEOUT"
